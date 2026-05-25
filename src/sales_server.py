@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import random
 import re
@@ -10,7 +11,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
-from pymongo import MongoClient, UpdateOne
+from pymongo import ASCENDING, DESCENDING, MongoClient, UpdateOne
 
 # NOTE: MCP CLI tools (e.g. `mcp dev file.py`) auto-detect a global named
 # `mcp`, `server`, or `app`. Keep this as `mcp` for compatibility.
@@ -176,16 +177,51 @@ def get_shopping_trend_by_customer_id(customer_id: int) -> str:
 
 
 @mcp.tool()
-def summarize_shopping_trends(field: str, limit: int = 10) -> str:
-    """Group-by summary for a field.
+def summarize_shopping_trends(
+    field: str = "",
+    limit: int = 10,
+    group_by: str | None = None,
+    aggregate: str | None = None,
+    aggregate_field: str | None = None,
+    aggregations: list[dict[str, Any]] | None = None,
+    sort_by: str | None = None,
+    sort: str = "desc",
+    filter: dict[str, Any] | None = None,
+) -> str:
+    """Group-by summary with optional multi-aggregations.
 
-    This accepts a single top-level field name. To keep the query safe and
-    predictable, field names are limited to letters/numbers/underscore.
+    Supports:
+    - group_by + aggregations (list of {op, field, alias})
+    - legacy aggregate/aggregate_field
+    - sort_by, sort, limit, filter
     """
 
-    field = (field or "").strip()
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field):
-        return "❌ Invalid field name. Use letters/numbers/underscore only (e.g. category, location, season)."
+    group_key = (group_by or field or "").strip()
+    agg_list = aggregations or []
+    flt = filter or {}
+
+    if group_key and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", group_key):
+        return "❌ Invalid group_by field name. Use letters/numbers/underscore only."
+
+    # Legacy single-aggregate fallback
+    if not agg_list and aggregate:
+        op = str(aggregate).strip().lower()
+        alias = f"{op}_{aggregate_field or group_key or 'count'}"
+        agg_list = [{"op": op, "field": aggregate_field, "alias": alias}]
+
+    # Default to count if nothing specified
+    if not agg_list:
+        if not group_key:
+            return "❌ Missing group_by field for summary."
+        agg_list = [{"op": "count", "alias": "total_purchases"}]
+
+    for agg in agg_list:
+        op = str(agg.get("op") or "").strip().lower()
+        if op not in {"count", "avg", "sum", "min", "max"}:
+            return "❌ Invalid aggregation op. Use avg, sum, count, min, max."
+        field_name = str(agg.get("field") or "").strip()
+        if op != "count" and field_name and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field_name):
+            return "❌ Invalid aggregation field name."
 
     # Prevent accidental high-cardinality / huge output.
     try:
@@ -195,11 +231,37 @@ def summarize_shopping_trends(field: str, limit: int = 10) -> str:
 
     try:
         collection = _get_mongo_collection()
-        pipeline = [
-            {"$group": {"_id": f"${field}", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": capped_limit},
-        ]
+
+        group_stage: dict[str, Any] = {"_id": f"${group_key}"}
+        for agg in agg_list:
+            op = str(agg.get("op") or "").strip().lower()
+            alias = str(agg.get("alias") or f"{op}_{agg.get('field') or 'count'}").strip()
+            field_name = str(agg.get("field") or "").strip()
+
+            if op == "count":
+                group_stage[alias] = {"$sum": 1}
+            elif op == "avg" and field_name:
+                group_stage[alias] = {"$avg": f"${field_name}"}
+            elif op == "sum" and field_name:
+                group_stage[alias] = {"$sum": f"${field_name}"}
+            elif op == "min" and field_name:
+                group_stage[alias] = {"$min": f"${field_name}"}
+            elif op == "max" and field_name:
+                group_stage[alias] = {"$max": f"${field_name}"}
+
+        sort_alias = str(sort_by or "").strip()
+        if not sort_alias and agg_list:
+            sort_alias = str(agg_list[0].get("alias") or "").strip()
+        sort_dir = DESCENDING if str(sort or "desc").lower() == "desc" else ASCENDING
+        sort_stage = {sort_alias: sort_dir} if sort_alias else {"_id": sort_dir}
+
+        pipeline: list[dict[str, Any]] = []
+        if flt:
+            pipeline.append({"$match": flt})
+        pipeline.append({"$group": group_stage})
+        pipeline.append({"$sort": sort_stage})
+        pipeline.append({"$limit": capped_limit})
+
         rows = list(collection.aggregate(pipeline))
     except Exception as exc:
         return f"❌ MongoDB aggregate error: {exc}"
@@ -207,10 +269,16 @@ def summarize_shopping_trends(field: str, limit: int = 10) -> str:
     if not rows:
         return "⚠️ No data found (did you import the CSV yet?)."
 
-    out = [f"✅ Top {len(rows)} values for '{field}':"]
-    for row in rows:
-        out.append(f"- {row.get('_id')}: {row.get('count')}")
-    return "\n".join(out)
+    results: list[dict[str, Any]] = []
+    for doc in rows:
+        row = {group_key: doc.get("_id")}
+        for key, value in doc.items():
+            if key == "_id":
+                continue
+            row[key] = round(value, 2) if isinstance(value, float) else value
+        results.append(row)
+
+    return json.dumps(results, ensure_ascii=True)
 
 
 @mcp.tool()
@@ -218,6 +286,9 @@ def query_shopping_trends(
     query_json: str = "{}",
     limit: int = 10,
     count_only: bool = False,
+    sort_by: str | None = None,
+    sort: str = "desc",
+    projection: list[str] | None = None,
 ) -> str:
     """Query the shopping trends MongoDB collection using a JSON query selector.
 
@@ -230,6 +301,7 @@ def query_shopping_trends(
     Example query_json: '{"color": "White"}' or '{"category": "Footwear", "season": "Winter"}'
 
     If count_only=True, returns the total count of matching records.
+    Optional: sort_by, sort (asc|desc), projection (list of fields).
     """
     import json
     try:
@@ -288,6 +360,10 @@ def query_shopping_trends(
         
         normalized_filter[actual_key] = v
 
+    def _normalize_field_key(raw_key: str) -> str:
+        cleaned = (raw_key or "").strip().lower()
+        return key_mapping.get(cleaned, raw_key)
+
     try:
         capped_limit = max(1, min(int(limit), 50))
     except Exception:
@@ -301,7 +377,19 @@ def query_shopping_trends(
                 return "⚠️ No matching records found in shopping trends database."
             return f"✅ Counted {total} matching records in shopping trends."
 
-        docs = list(collection.find(normalized_filter, {"_id": 0}).limit(capped_limit))
+        projection_doc: dict[str, int] = {"_id": 0}
+        if projection:
+            projection_doc = {str(field): 1 for field in projection if str(field).strip()}
+            projection_doc["_id"] = 0
+
+        cursor = collection.find(normalized_filter, projection_doc)
+
+        sort_key = _normalize_field_key(sort_by or "").strip()
+        if sort_key:
+            direction = DESCENDING if str(sort or "desc").lower() == "desc" else ASCENDING
+            cursor = cursor.sort(sort_key, direction)
+
+        docs = list(cursor.limit(capped_limit))
     except Exception as exc:
         return f"❌ MongoDB query error: {exc}"
 

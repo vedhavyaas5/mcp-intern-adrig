@@ -14,7 +14,7 @@ function Bubble({ role, content }) {
         }
       >
         <div className="mb-1 text-[11px] uppercase tracking-wide text-zinc-400">
-          {isUser ? 'You' : 'Groq'}
+          {isUser ? 'You' : 'Gemini'}
         </div>
         <div className="whitespace-pre-wrap">{content}</div>
       </div>
@@ -33,7 +33,7 @@ function App() {
       id: crypto.randomUUID(),
       role: 'assistant',
       content:
-        'Hi — I am a Groq chatbot connected to MCP tools. Ask about a support ticket (e.g. TKT-101) or product catalog questions.',
+        'Hi — ask about shopping trends (e.g. top rated products, top 5 categories) or support tickets (e.g. TKT-101).',
     },
   ])
 
@@ -63,7 +63,7 @@ function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: nextMessages.map((m) => ({ role: m.role, content: m.content })) }),
+        body: JSON.stringify({ message: trimmed }),
       })
 
       const data = await res.json().catch(() => ({}))
@@ -89,7 +89,7 @@ function App() {
       <div className="mx-auto flex h-full max-w-3xl flex-col">
         <header className="flex h-14 items-center justify-between border-b border-zinc-800/60 px-4">
           <div className="text-sm font-semibold tracking-tight">MCP Chatbot</div>
-          <div className="text-xs text-zinc-400">Groq + MCP</div>
+          <div className="text-xs text-zinc-400">Gemini + MCP</div>
         </header>
 
         <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
@@ -99,7 +99,7 @@ function App() {
             ))}
 
             {isSending ? (
-              <div className="text-xs text-zinc-400">Groq is thinking…</div>
+              <div className="text-xs text-zinc-400">Thinking…</div>
             ) : null}
 
             {error ? (

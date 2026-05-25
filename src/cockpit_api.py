@@ -18,9 +18,12 @@ from starlette.routing import Route
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
+
+from src.framework import ChatbotFramework
+from src.llm_mcp_bridge import LLMMCPBridge, coerce_query_json, normalize_tool_call
+from src.schema_inspector import SchemaInspector
 
 
 def _require_file(path: Path) -> None:
@@ -32,12 +35,30 @@ def _require_file(path: Path) -> None:
 
 
 def _get_llm():
-    groq_key = os.getenv("GROQ_API_KEY")
-    if groq_key:
-        model = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
-        return ChatGroq(model=model, temperature=0.1, groq_api_key=groq_key)
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if gemini_key:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except Exception as exc:
+            raise RuntimeError(
+                "Gemini support is not installed. Run: pip install langchain-google-genai"
+            ) from exc
 
-    # Local fallback LLM for development when GROQ_API_KEY is not set.
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "temperature": 0,
+            "google_api_key": gemini_key,
+        }
+        try:
+            return ChatGoogleGenerativeAI(
+                **kwargs,
+                model_kwargs={"response_mime_type": "application/json"},
+            )
+        except TypeError:
+            return ChatGoogleGenerativeAI(**kwargs)
+
+    # Local fallback LLM for development when GEMINI_API_KEY is not set.
     # This implements minimal, deterministic behaviors used by the router
     # and shopping-trends helper prompts so the server can run offline.
     class _DummyResponse:
@@ -73,7 +94,36 @@ def _get_llm():
                     return _DummyResponse(json.dumps({"kind": "tool", "tool_name": "import_shopping_trends_csv_to_mongodb", "tool_args": {}}))
                 if txt.isdigit():
                     return _DummyResponse(json.dumps({"kind": "tool", "tool_name": "get_shopping_trend_by_customer_id", "tool_args": {"customer_id": int(txt)}}))
-                return _DummyResponse(json.dumps({"kind": "answer", "answer": "Local fallback: GROQ API key not set. For full LLM features set GROQ_API_KEY. Ask 'import' to load the dataset into MongoDB."}))
+                return _DummyResponse(json.dumps({"kind": "answer", "answer": "Local fallback: Gemini API key not set. For full LLM features set GEMINI_API_KEY. Ask 'import' to load the dataset into MongoDB."}))
+
+            # Schema framework: MCP query compiler (shopping trends)
+            if "MCP Query Compiler" in system_text or "strict JSON query translator" in system_text:
+                from src.intent_resolver import SchemaIntentResolver
+
+                resolved = SchemaIntentResolver().resolve(human_text or "")
+                if resolved:
+                    return _DummyResponse(json.dumps(resolved))
+                if any(
+                    k in (human_text or "").lower()
+                    for k in ("top", "rated", "rating", "best", "suggest", "recommend", "item", "product")
+                ):
+                    return _DummyResponse(
+                        json.dumps(
+                            {
+                                "tool": "summarize_shopping_trends",
+                                "params": {
+                                    "group_by": "item_purchased",
+                                    "aggregations": [
+                                        {"op": "avg", "field": "review_rating", "alias": "avg_rating"},
+                                        {"op": "count", "alias": "total_purchases"},
+                                    ],
+                                    "sort_by": "avg_rating",
+                                    "sort": "desc",
+                                    "limit": 10,
+                                },
+                            }
+                        )
+                    )
 
             # Shopping trends tool prompt heuristics
             if "You decide how to answer a question about a shopping trends dataset" in system_text:
@@ -402,6 +452,93 @@ def _looks_like_shopping_trends_query(text: str) -> bool:
     return False
 
 
+def _fast_parse_shopping_trends_query(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+
+    lowered = text.strip().lower()
+
+    # import / load
+    if any(k in lowered for k in ("import", "load", "ingest")):
+        return {"kind": "tool", "tool_name": "import_shopping_trends_csv_to_mongodb", "tool_args": {}}
+
+    # summarize / top requests
+    if any(w in lowered for w in ("top ", "most ", "summary", "summarize", "breakdown", "distribution")):
+        m = re.search(r"top\s+(\d{1,2})", lowered)
+        limit = int(m.group(1)) if m else 10
+        for field in _SHOPPING_TRENDS_FIELDS:
+            if field in lowered or field.replace("_", " ") in lowered:
+                return {"kind": "tool", "tool_name": "summarize_shopping_trends", "tool_args": {"field": field, "limit": limit}}
+        return {"kind": "tool", "tool_name": "summarize_shopping_trends", "tool_args": {"field": "category", "limit": limit}}
+
+    # count / how many
+    if any(w in lowered for w in ("how many", "count ", "number of ", "how much")):
+        # color-specific pattern like 'how many white items'
+        for color in _SHOPPING_TRENDS_COLOR_WORDS:
+            if color in lowered and any(tok in lowered for tok in ("item", "items", "product", "products")):
+                return {"kind": "tool", "tool_name": "query_shopping_trends", "tool_args": {"query_json": json.dumps({"color": color.title()}), "count_only": True}}
+
+        for field in _SHOPPING_TRENDS_FIELDS:
+            fname = field.replace("_", " ")
+            m = re.search(rf"{re.escape(fname)}\s*[:=]?\s*(\w+)", lowered)
+            if m:
+                val = m.group(1).strip().title()
+                return {"kind": "tool", "tool_name": "query_shopping_trends", "tool_args": {"query_json": json.dumps({field: val}), "count_only": True}}
+        return {"kind": "tool", "tool_name": "query_shopping_trends", "tool_args": {"query_json": json.dumps({}), "count_only": True}}
+
+    # suggest / recommend / best item|product
+    if any(w in lowered for w in ("suggest", "recommend", "best item", "best product", "good item", "good product")):
+        return {
+            "kind": "tool",
+            "tool_name": "summarize_shopping_trends",
+            "tool_args": {
+                "group_by": "item_purchased",
+                "aggregations": [
+                    {"op": "avg", "field": "review_rating", "alias": "avg_rating"},
+                    {"op": "count", "alias": "total_purchases"},
+                    {"op": "sum", "field": "purchase_amount_usd", "alias": "revenue"},
+                ],
+                "sort_by": "avg_rating",
+                "sort": "desc",
+                "limit": 10,
+            },
+        }
+
+    # top rated / max/min — group by product, not by rating value
+    if any(w in lowered for w in ("top rated", "highest rated", "max rating", "minimum rating", "lowest rated", "top rated product", "best rated")):
+        return {
+            "kind": "tool",
+            "tool_name": "summarize_shopping_trends",
+            "tool_args": {
+                "group_by": "item_purchased",
+                "aggregations": [
+                    {"op": "avg", "field": "review_rating", "alias": "avg_rating"},
+                    {"op": "count", "alias": "total_purchases"},
+                    {"op": "sum", "field": "purchase_amount_usd", "alias": "revenue"},
+                ],
+                "sort_by": "avg_rating",
+                "sort": "desc",
+                "limit": 10,
+            },
+        }
+
+    # simple equality filters like 'color white' or 'season winter'
+    for field in _SHOPPING_TRENDS_FIELDS:
+        fname = field.replace("_", " ")
+        m = re.search(rf"\b{re.escape(fname)}\b\s*(is|=|:)?\s*(\w[\w\s-]+)", lowered)
+        if m:
+            val = m.group(2).strip()
+            if field in {"color", "location", "category", "item_purchased", "season", "gender", "payment_method", "shipping_type", "preferred_payment_method", "frequency_of_purchases", "size"}:
+                val = val.title()
+            try:
+                qjson = json.dumps({field: val})
+            except Exception:
+                qjson = json.dumps({field: str(val)})
+            return {"kind": "tool", "tool_name": "query_shopping_trends", "tool_args": {"query_json": qjson, "limit": 10}}
+
+    return None
+
+
 def _coerce_query_json(value: Any) -> str:
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=True)
@@ -520,9 +657,24 @@ Return only the corrected/standardized text, with no introductory text, explanat
 
 async def _route_with_llm(llm: Any, user_text: str) -> dict[str, Any]:
     if _looks_like_shopping_trends_query(user_text):
+        # Try a fast deterministic parse first to save LLM tokens for common queries.
+        fast_decision = _fast_parse_shopping_trends_query(user_text)
+        if fast_decision:
+            return fast_decision
+
         decision = await _build_shopping_trends_query(llm, user_text)
         if decision:
             return decision
+    lowered = (user_text or "").lower()
+    if (
+        re.search(r"\b(suggest|recommend|best|better)\b", lowered)
+        and re.search(r"\b(product|products|solution|plan|suite)\b", lowered)
+    ):
+        return {
+            "kind": "tool",
+            "tool_name": "query_product_catalog",
+            "tool_args": {"search_intent": user_text},
+        }
 
     response = await llm.ainvoke(
         [
@@ -573,21 +725,68 @@ def _sanitize_tool_args(tool_name: str, tool_args: dict[str, Any]) -> dict[str, 
 
     if tool_name == "summarize_shopping_trends":
         field_raw = str(args.get("field") or "").strip()
-        field = _normalize_field_name(field_raw)
-        if not field:
-            raise ValueError("missing field")
+        group_by_raw = str(args.get("group_by") or "").strip()
+        aggregate_raw = str(args.get("aggregate") or "").strip().lower()
+        aggregate_field_raw = str(args.get("aggregate_field") or "").strip()
+
+        field = _normalize_field_name(field_raw) if field_raw else ""
+        group_by = _normalize_field_name(group_by_raw) if group_by_raw else ""
+        aggregate_field = _normalize_field_name(aggregate_field_raw) if aggregate_field_raw else ""
+
+        aggregations = args.get("aggregations")
+        if aggregations is not None and not isinstance(aggregations, list):
+            aggregations = []
+
         limit_raw = args.get("limit", 10)
         try:
             limit = int(limit_raw)
         except Exception:
             limit = 10
         limit = max(1, min(limit, 50))
-        return {"field": field, "limit": limit}
+
+        sort_by = args.get("sort_by")
+        sort = args.get("sort") or args.get("sort_order")
+        flt = args.get("filter") if isinstance(args.get("filter"), dict) else None
+
+        clean_args: dict[str, Any] = {"limit": limit}
+        if group_by:
+            clean_args["group_by"] = group_by
+        elif field:
+            clean_args["field"] = field
+
+        if aggregations:
+            clean_args["aggregations"] = aggregations
+        if sort_by:
+            clean_args["sort_by"] = str(sort_by)
+        if sort:
+            clean_args["sort"] = str(sort)
+        if flt:
+            clean_args["filter"] = flt
+        if aggregate_raw:
+            clean_args["aggregate"] = aggregate_raw
+        if aggregate_field:
+            clean_args["aggregate_field"] = aggregate_field
+
+        if not group_by and not field and not aggregations and not aggregate_raw:
+            raise ValueError("missing group_by")
+        return clean_args
 
     if tool_name == "query_shopping_trends":
-        query_json = str(args.get("query_json") or "{}").strip()
+        query_json_value = args.get("query_json")
+        if query_json_value is None and isinstance(args.get("filter"), dict):
+            query_json_value = args.get("filter")
+        if isinstance(query_json_value, dict):
+            query_json = json.dumps(query_json_value, ensure_ascii=True)
+        else:
+            query_json = str(query_json_value or "{}").strip()
         limit_raw = args.get("limit", 10)
         count_only_raw = args.get("count_only")
+        aggregate_raw = str(args.get("aggregate") or "").strip().lower()
+        if aggregate_raw in {"count", "how_many", "total"}:
+            count_only_raw = True
+        sort_by = args.get("sort_by")
+        sort = args.get("sort") or args.get("sort_order") or "desc"
+        projection = args.get("projection")
         try:
             limit = int(limit_raw)
         except Exception:
@@ -597,6 +796,15 @@ def _sanitize_tool_args(tool_name: str, tool_args: dict[str, Any]) -> dict[str, 
         clean_args = {"query_json": query_json, "limit": limit}
         if count_only is not None:
             clean_args["count_only"] = count_only
+        if sort_by:
+            clean_args["sort_by"] = str(sort_by)
+        if sort:
+            clean_args["sort"] = str(sort)
+        if projection:
+            if isinstance(projection, list):
+                clean_args["projection"] = [str(p) for p in projection if str(p).strip()]
+            elif isinstance(projection, str):
+                clean_args["projection"] = [p.strip() for p in projection.split(",") if p.strip()]
         return clean_args
 
     return args
@@ -655,16 +863,73 @@ async def _chat(request: Request) -> JSONResponse:
     llm = request.app.state.llm
     tools_by_name: dict[str, BaseTool] = request.app.state.tools_by_name
     mcp_lock: asyncio.Lock = request.app.state.mcp_lock
+    schema_bridge: LLMMCPBridge | None = getattr(request.app.state, "schema_bridge", None)
+    framework: ChatbotFramework | None = getattr(request.app.state, "framework", None)
 
-    # Pre-process: adjust spelling and optimize the query using the LLM
-    user_text = await _adjust_spelling_and_optimize_query(llm, user_text)
+    schema_mode = str(os.getenv("SCHEMA_MODE", "1")).strip().lower() in {"1", "true", "yes"}
+    is_shopping_query = _looks_like_shopping_trends_query(user_text)
+    decision: dict[str, Any] | None = None
+    # Use schema framework only for shopping-trends intents.
+    use_framework = bool(framework) and is_shopping_query
+    )
+    if use_framework:
+        try:
+            response = await framework.chat(user_text)
+            return JSONResponse(response)
+        except Exception:
+            decision = _fast_parse_shopping_trends_query(user_text)
+            if not decision:
+                return JSONResponse(
+                    {"reply": "I couldn't complete that request right now. Please try again."}
+                )
 
-    # 1) Use the LLM only to understand intent + pick one tool.
-    try:
-        decision = await _route_with_llm(llm, user_text)
-    except Exception:
-        # Keep the endpoint stable; return a friendly message.
-        return JSONResponse({"reply": "I couldn't process that right now. Please try again."})
+    if decision is None and schema_mode and schema_bridge and is_shopping_query:
+        try:
+            tool_call = await schema_bridge.translate(user_text)
+        except Exception:
+            tool_call = None
+
+        if tool_call:
+            normalized = normalize_tool_call(tool_call)
+            tool_name = str(normalized.get("tool_name") or "").strip()
+            tool_args = normalized.get("tool_args") or {}
+
+            if tool_name == "query_shopping_trends":
+                if "query_json" in tool_args:
+                    tool_args["query_json"] = coerce_query_json(tool_args.get("query_json"))
+                if "limit" in tool_args:
+                    try:
+                        tool_args["limit"] = int(tool_args.get("limit"))
+                    except Exception:
+                        tool_args["limit"] = 10
+
+            # Follow the same validation flow as the router.
+            decision = {"kind": "tool", "tool_name": tool_name, "tool_args": tool_args}
+        else:
+            return JSONResponse({"reply": "I couldn't understand that request. Please rephrase."})
+    elif decision is None:
+        # 1) Use the LLM only to understand intent + pick one tool.
+        if _looks_like_shopping_trends_query(user_text):
+            fast_decision = _fast_parse_shopping_trends_query(user_text)
+            if fast_decision:
+                decision = fast_decision
+            else:
+                try:
+                    decision = await _build_shopping_trends_query(llm, user_text)
+                except Exception:
+                    decision = None
+                if not decision:
+                    return JSONResponse(
+                        {"reply": "I couldn't map that to a database query. Try: top rated products."}
+                    )
+        else:
+            user_text = await _adjust_spelling_and_optimize_query(llm, user_text)
+            try:
+                decision = await _route_with_llm(llm, user_text)
+            except Exception:
+                return JSONResponse(
+                    {"reply": "I couldn't process that right now. Please try again."}
+                )
 
     kind = str(decision.get("kind") or "").strip().lower()
     if kind == "answer":
@@ -721,6 +986,11 @@ async def _chat(request: Request) -> JSONResponse:
     if reply_mode == "raw":
         return JSONResponse({"reply": tool_text})
 
+    # Structured shopping-trends tools: return MCP text as-is (avoids LLM inventing "no products").
+    if tool_name in {"summarize_shopping_trends", "query_shopping_trends"}:
+        if tool_text.startswith("✅") or tool_text.startswith("[") or "Found " in tool_text:
+            return JSONResponse({"reply": tool_text})
+
     try:
         rewritten = await _rewrite_with_llm(llm, user_text, tool_text)
         return JSONResponse({"reply": rewritten})
@@ -735,7 +1005,7 @@ async def _health(_: Request) -> JSONResponse:
 @asynccontextmanager
 async def _lifespan(app: Starlette):
     project_root = Path(__file__).resolve().parent.parent
-    load_dotenv(dotenv_path=project_root / ".env")
+    load_dotenv(dotenv_path=project_root / ".env", override=True)
 
     src_dir = project_root / "src"
     support_server = src_dir / "support_server.py"
@@ -780,6 +1050,36 @@ async def _lifespan(app: Starlette):
     app.state.llm = llm
     app.state.tools_by_name = tools_by_name
     app.state.mcp_lock = asyncio.Lock()
+
+    inspector = SchemaInspector()
+    inspector.build()
+    schema_prompt = inspector.to_prompt()
+    schema_dict = inspector.schema() or {}
+
+    async def _call_tool(tool_name: str, params: dict[str, Any]) -> Any:
+        tool = tools_by_name.get(tool_name)
+        if tool is None:
+            raise RuntimeError(f"Tool not available: {tool_name}")
+        async with app.state.mcp_lock:
+            result = await tool.ainvoke(params)
+        tool_content: Any = result
+        if isinstance(result, dict) and "content" in result:
+            tool_content = result.get("content")
+        elif isinstance(result, tuple) and len(result) == 2:
+            tool_content = result[0]
+        return _tool_content_to_text(tool_content).strip()
+
+    app.state.framework = ChatbotFramework(
+        schema_text=schema_prompt,
+        llm=llm,
+        tool_caller=_call_tool,
+        sanitizer=_sanitize_tool_args,
+        debug=str(os.getenv("SCHEMA_DEBUG", "false")).lower() in {"1", "true", "yes"},
+        schema=schema_dict,
+    )
+    app.state.schema_bridge = LLMMCPBridge(
+        schema_prompt=schema_prompt, llm=llm, schema=schema_dict
+    )
 
     try:
         yield
